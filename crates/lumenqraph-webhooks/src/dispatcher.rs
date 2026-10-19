@@ -19,6 +19,7 @@ use sha2::Sha256;
 use sqlx::types::Json;
 use sqlx::PgPool;
 use std::collections::HashMap;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 use tokio::sync::Semaphore;
@@ -351,6 +352,9 @@ struct DueDelivery {
     event_id: Option<String>,
     upgrade_id: Option<i64>,
     created_at: DateTime<Utc>,
+    /// Pre-built envelope, joined in `fetch_due` so `send` never re-reads the
+    /// event/upgrade row (#620).
+    envelope: WebhookEnvelope,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -361,11 +365,43 @@ pub struct DeliveryOutcome {
 }
 
 /// Atomically claim and fetch due deliveries, handling decryption failures gracefully.
+///
+/// The event/upgrade payloads are joined in the same statement so a batch of N
+/// deliveries costs O(1) queries rather than N+1 (#620).
 async fn fetch_due(pool: &PgPool, batch: i64, encryption_key: &str) -> anyhow::Result<Vec<DueDelivery>> {
     let worker = worker_id();
     let lock_duration = Duration::seconds(60);
 
-    let claimed: Vec<(i64, Uuid, i32, String, Option<String>, Option<String>, Option<String>, Option<i64>, DateTime<Utc>)> = sqlx::query_as(
+    #[allow(clippy::type_complexity)]
+    let claimed: Vec<(
+        i64,
+        Uuid,
+        i32,
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<i64>,
+        DateTime<Utc>,
+        Option<String>,
+        Option<String>,
+        Option<i64>,
+        Option<DateTime<Utc>>,
+        Option<String>,
+        Option<Json<Vec<String>>>,
+        Option<String>,
+        Option<Json<serde_json::Value>>,
+        Option<Json<serde_json::Value>>,
+        Option<Json<serde_json::Value>>,
+        Option<String>,
+        Option<bool>,
+        Option<i32>,
+        Option<String>,
+        Option<String>,
+        Option<bool>,
+        Option<Json<serde_json::Value>>,
+        Option<DateTime<Utc>>,
+    )> = sqlx::query_as(
         "UPDATE webhook_deliveries d
          SET locked_until = now() + $1, locked_by = $2
          WHERE d.id IN (
@@ -388,7 +424,25 @@ async fn fetch_due(pool: &PgPool, batch: i64, encryption_key: &str) -> anyhow::R
                     FROM webhook_subscriptions WHERE id = d.subscription_id),
                    d.event_id,
                    d.upgrade_id,
-                   d.created_at",
+                   d.created_at,
+                   e.event_id,
+                   e.contract_id,
+                   e.ledger,
+                   e.ledger_closed_at,
+                   e.event_name,
+                   e.topics,
+                   e.value,
+                   e.decoded_topics,
+                   e.decoded_value,
+                   e.enriched,
+                   e.tx_hash,
+                   e.in_successful_call,
+                   v.contract_id,
+                   v.wasm_hash,
+                   v.previous_wasm_hash,
+                   v.breaking,
+                   v.diff,
+                   v.observed_at",
     )
     .bind(lock_duration)
     .bind(&worker)
@@ -400,7 +454,38 @@ async fn fetch_due(pool: &PgPool, batch: i64, encryption_key: &str) -> anyhow::R
     let mut deliveries = Vec::new();
     let mut failed_subscriptions = Vec::new();
 
-    for (id, sub_id, attempts, url, decrypted_secret, decrypted_previous, event_id, upgrade_id, created_at) in claimed {
+    for row in claimed {
+        let (
+            id,
+            sub_id,
+            attempts,
+            url,
+            decrypted_secret,
+            decrypted_previous,
+            event_id,
+            upgrade_id,
+            created_at,
+            ev_event_id,
+            ev_contract_id,
+            ev_ledger,
+            ev_ledger_closed_at,
+            ev_event_name,
+            ev_topics,
+            ev_value,
+            ev_decoded_topics,
+            ev_decoded_value,
+            ev_enriched,
+            ev_tx_hash,
+            ev_in_successful_call,
+            up_version,
+            up_contract_id,
+            up_wasm_hash,
+            up_previous_wasm_hash,
+            up_breaking,
+            up_diff,
+            up_observed_at,
+        ) = row;
+
         let secret = match decrypted_secret {
             None => {
                 warn!(delivery = id, subscription = %sub_id, "failed to decrypt secret (NULL or wrong key)");
@@ -417,6 +502,57 @@ async fn fetch_due(pool: &PgPool, batch: i64, encryption_key: &str) -> anyhow::R
             Some(s) => s,
         };
 
+        // Build the envelope from the joined row; no extra SELECT in `send`.
+        let envelope = if let (Some(event_id), Some(contract_id), Some(ledger), Some(ledger_closed_at), Some(value), Some(decoded_topics), Some(decoded_value), Some(tx_hash), Some(in_successful_call)) = (
+            ev_event_id,
+            ev_contract_id,
+            ev_ledger,
+            ev_ledger_closed_at,
+            ev_value,
+            ev_decoded_topics,
+            ev_decoded_value,
+            ev_tx_hash,
+            ev_in_successful_call,
+        ) {
+            let event_data = ContractEventData {
+                event_id,
+                contract_id,
+                ledger,
+                ledger_closed_at,
+                event_name: ev_event_name,
+                topics: ev_topics.map(|j| j.0).unwrap_or_default(),
+                value,
+                decoded_topics: decoded_topics.0,
+                decoded_value: decoded_value.0,
+                enriched: ev_enriched.map(|j| j.0),
+                tx_hash,
+                in_successful_call,
+            };
+            WebhookEnvelope::for_event(id, created_at, event_data)
+        } else if let (Some(version), Some(contract_id), Some(wasm_hash), Some(breaking), Some(diff), Some(observed_at)) = (
+            up_version,
+            up_contract_id,
+            up_wasm_hash,
+            up_breaking,
+            up_diff,
+            up_observed_at,
+        ) {
+            let upgrade_data = ContractUpgradeData {
+                contract_id,
+                version,
+                wasm_hash,
+                previous_wasm_hash: up_previous_wasm_hash,
+                breaking,
+                diff: diff.0,
+                observed_at,
+            };
+            WebhookEnvelope::for_upgrade(id, created_at, upgrade_data)
+        } else {
+            warn!(delivery = id, "delivery has neither event nor upgrade payload");
+            let _ = mark_failed_undecryptable(pool, id, "delivery has neither event_id nor upgrade_id").await;
+            continue;
+        };
+
         deliveries.push(DueDelivery {
             id,
             subscription_id: sub_id,
@@ -427,6 +563,7 @@ async fn fetch_due(pool: &PgPool, batch: i64, encryption_key: &str) -> anyhow::R
             event_id,
             upgrade_id,
             created_at,
+            envelope,
         });
     }
 
@@ -482,26 +619,61 @@ pub async fn deliver_with_shutdown(
     if shutdown.is_cancelled() {
         return Ok((0, 0));
     }
-    let deliveries = fetch_due(pool, config.batch_size, &config.encryption_key).await?;
-    if deliveries.is_empty() {
-        return Ok((0, 0));
-    }
 
-    let per_host_limits = build_per_host_limits(&deliveries, config.max_concurrent_per_host);
+    // Continuous worker pool: claim a batch, spawn bounded sends, and claim
+    // more as slots free up. A slow subscriber only occupies its own slot and
+    // never blocks the pipeline for other tenants (#621).
     let semaphore = Arc::new(Semaphore::new(config.max_concurrent_deliveries));
+    let per_host_limits: Arc<tokio::sync::Mutex<HashMap<String, Arc<Semaphore>>>> =
+        Arc::new(tokio::sync::Mutex::new(HashMap::new()));
     let config = Arc::new(config.clone());
 
-    let results: Vec<_> = stream::iter(deliveries)
-        .map(|d| {
+    let mut delivered: u64 = 0;
+    let mut failed: u64 = 0;
+    let mut inflight: futures::stream::FuturesUnordered<_> = stream::FuturesUnordered::new();
+
+    loop {
+        if shutdown.is_cancelled() {
+            break;
+        }
+
+        // Only claim when there is spare capacity; otherwise drain one result.
+        let available = semaphore.available_permits();
+        if available == 0 {
+            if let Some(result) = inflight.next().await {
+                if let Some((ok, _sub)) = result {
+                    if ok {
+                        delivered += 1;
+                    } else {
+                        failed += 1;
+                    }
+                }
+            }
+            continue;
+        }
+
+        let claim = available.min(config.batch_size.max(1) as usize);
+        let deliveries = fetch_due(pool, claim as i64, &config.encryption_key).await?;
+        if deliveries.is_empty() {
+            break;
+        }
+
+        for d in deliveries {
             let pool = pool.clone();
             let http = http.clone();
             let config = config.clone();
             let semaphore = semaphore.clone();
             let per_host_limits = per_host_limits.clone();
 
-            async move {
+            inflight.push(async move {
                 let host = extract_host(&d.url);
-                let host_semaphore = per_host_limits.get(&host).expect("host should have a semaphore");
+                let host_semaphore = {
+                    let mut limits = per_host_limits.lock().await;
+                    limits
+                        .entry(host)
+                        .or_insert_with(|| Arc::new(Semaphore::new(config.max_concurrent_per_host)))
+                        .clone()
+                };
 
                 let _permit = semaphore.acquire().await.ok()?;
                 let _host_permit = host_semaphore.acquire().await.ok()?;
@@ -553,33 +725,25 @@ pub async fn deliver_with_shutdown(
                         Some((false, d.subscription_id))
                     }
                 }
-            }
-        })
-        .buffer_unordered(config.max_concurrent_deliveries)
-        .collect()
-        .await;
+            });
+        }
+    }
 
-    let delivered = results.iter().filter(|r| r.map_or(false, |(s, _)| s)).count() as u64;
-    let failed = results.iter().filter(|r| r.map_or(false, |(s, _)| !s)).count() as u64;
+    // Drain any remaining in-flight sends.
+    while let Some(result) = inflight.next().await {
+        if let Some((ok, _sub)) = result {
+            if ok {
+                delivered += 1;
+            } else {
+                failed += 1;
+            }
+        }
+    }
 
     if delivered > 0 || failed > 0 {
         info!(delivered, failed, "webhook deliveries processed");
     }
     Ok((delivered, failed))
-}
-
-fn build_per_host_limits(
-    deliveries: &[DueDelivery],
-    max_per_host: usize,
-) -> HashMap<String, Arc<Semaphore>> {
-    let mut limits: HashMap<String, Arc<Semaphore>> = HashMap::new();
-    for d in deliveries {
-        let host = extract_host(&d.url);
-        limits
-            .entry(host)
-            .or_insert_with(|| Arc::new(Semaphore::new(max_per_host)));
-    }
-    limits
 }
 
 fn extract_host(url: &str) -> String {
