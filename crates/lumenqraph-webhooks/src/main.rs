@@ -53,7 +53,11 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // Redirects are never followed (SSRF guard, see `build_delivery_client`).
-    let http = dispatcher::build_delivery_client(config.connect_timeout(), config.total_timeout())?;
+    // The dispatcher also reuses these timeouts when it builds the per-delivery
+    // IP-pinned client, so redirects stay disabled there too (#615).
+    let connect_timeout = config.connect_timeout();
+    let total_timeout = config.total_timeout();
+    let http = dispatcher::build_delivery_client(connect_timeout, total_timeout)?;
 
     let pool_arc = std::sync::Arc::new(pool.clone());
     metrics::start_metrics_server(pool_arc, &config.metrics_bind_addr).await?;
